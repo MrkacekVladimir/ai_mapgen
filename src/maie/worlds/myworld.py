@@ -104,8 +104,8 @@ TEAM_COLORS = [
 @dataclass
 class MyWorldConfig:
     """Configuration for WC3-style strategy game map generation."""
-    width: int = 2048
-    height: int = 1536
+    width: int = 1920
+    height: int = 1080
     tile_size: float = 16.0
     seed: int = 42
 
@@ -260,10 +260,35 @@ class MyWorld:
         return [self.layers[layer] for layer in which]
 
     def debug_layers(self) -> list[DrawLayer]:
-        """Get debug visualization layers."""
+        """Get comprehensive debug visualization layers."""
         return [
-            DrawLayer(z=40, label="elevation", draw=lambda ctx: self._draw_array(ctx, self.elevation)),
-            DrawLayer(z=42, label="terrain_type", draw=lambda ctx: self._draw_array(ctx, self.terrain_type.astype(float))),
+            # === Raw Terrain Data ===
+            DrawLayer(z=100, label="dbg_elevation", draw=self._draw_debug_elevation),
+            DrawLayer(z=101, label="dbg_is_land", draw=self._draw_debug_is_land),
+            DrawLayer(z=102, label="dbg_terrain_type", draw=self._draw_debug_terrain_type),
+            DrawLayer(z=103, label="dbg_is_trail", draw=self._draw_debug_is_trail),
+            DrawLayer(z=104, label="dbg_is_forest", draw=self._draw_debug_is_forest),
+
+            # === Spawn Analysis ===
+            DrawLayer(z=110, label="dbg_spawn_radius", draw=self._draw_debug_spawn_radius),
+            DrawLayer(z=111, label="dbg_team_angles", draw=self._draw_debug_team_angles),
+            DrawLayer(z=112, label="dbg_teammate_distances", draw=self._draw_debug_teammate_distances),
+
+            # === Pathfinding Debug ===
+            DrawLayer(z=120, label="dbg_dijkstra_dist", draw=self._draw_debug_dijkstra_distances),
+            DrawLayer(z=121, label="dbg_trail_costs", draw=self._draw_debug_trail_costs),
+
+            # === Forest Generation ===
+            DrawLayer(z=130, label="dbg_forest_density", draw=self._draw_debug_forest_density),
+
+            # === Separator Zones ===
+            DrawLayer(z=140, label="dbg_boundary_zones", draw=self._draw_debug_boundary_zones),
+            DrawLayer(z=141, label="dbg_separator_areas", draw=self._draw_debug_separator_areas),
+
+            # === Distance-based Analysis ===
+            DrawLayer(z=150, label="dbg_spawn_distances", draw=self._draw_debug_distances),
+            DrawLayer(z=151, label="dbg_creep_zones", draw=self._draw_debug_creep_zones),
+            DrawLayer(z=152, label="dbg_team_territories", draw=self._draw_debug_team_territories),
         ]
 
     # =========================================================================
@@ -462,74 +487,178 @@ class MyWorld:
     # Phase 3: Neutral Creep Camp Placement
     # =========================================================================
     def _generate_creep_camps(self):
-        """Generate neutral creep camps with distance-based difficulty tiers."""
+        """Generate neutral creep camps with balanced per-team distribution."""
         rng = random.Random(self.cfg.seed + 200)
         self.creep_camps = []
 
+        if not self.spawns:
+            return
+
+        num_teams = len(self.cfg.teams)
+        total_players = sum(self.cfg.teams)
+
+        # Calculate total camps based on map area
         map_area_tiles = (self.width * self.height) / (self.ts ** 2)
         base_camps = int(map_area_tiles / 1500 * self.cfg.creep_density)
 
-        target_easy = int(base_camps * 0.50)
-        target_medium = int(base_camps * 0.35)
-        target_hard = int(base_camps * 0.15)
+        # Distribute camps: each team gets equal share of easy/medium, hard is contested
+        easy_per_team = max(1, int(base_camps * 0.50 / num_teams))
+        medium_per_team = max(1, int(base_camps * 0.35 / num_teams))
+        hard_total = max(1, int(base_camps * 0.15))
 
-        counts = {d: 0 for d in CreepDifficulty}
-        targets = {
-            CreepDifficulty.EASY: target_easy,
-            CreepDifficulty.MEDIUM: target_medium,
-            CreepDifficulty.HARD: target_hard,
-        }
-
-        candidates = poisson_disc_2d(
-            bounds=(self.ts * 3, self.ts * 3, self.width - self.ts * 3, self.height - self.ts * 3),
-            radius=self.ts * 6,
-            n_points=base_camps * 3,
-            seed=self.cfg.seed + 201
-        )
-
-        spawn_positions = [s.position for s in self.spawns]
-        mine_positions = [m.position for m in self.gold_mines]
-
+        # Distance thresholds relative to spawn radius
         easy_max_dist = self.spawn_radius * 0.4
         medium_max_dist = self.spawn_radius * 0.8
 
-        for candidate in candidates:
-            if all(counts[d] >= targets[d] for d in CreepDifficulty):
-                break
+        # Group spawns by team
+        team_spawns: dict[int, list[PlayerSpawn]] = defaultdict(list)
+        for spawn in self.spawns:
+            team_spawns[spawn.team_id].append(spawn)
 
-            x, y = candidate
+        mine_positions = [m.position for m in self.gold_mines]
+        all_spawn_positions = [s.position for s in self.spawns]
+        placed_positions: list[Vec2] = []
 
-            min_spawn_dist = self.ts * 5
-            if any(self._distance((x, y), sp) < min_spawn_dist for sp in spawn_positions):
-                continue
+        def is_valid_placement(pos: Vec2, min_camp_dist: float = None) -> bool:
+            """Check if position is valid for camp placement."""
+            if min_camp_dist is None:
+                min_camp_dist = self.ts * 6
 
-            min_mine_dist = self.ts * 4
-            if any(self._distance((x, y), mp) < min_mine_dist for mp in mine_positions):
-                continue
+            # Not too close to any spawn
+            if any(self._distance(pos, sp) < self.ts * 5 for sp in all_spawn_positions):
+                return False
 
-            dist_to_nearest = min(self._distance((x, y), sp) for sp in spawn_positions)
+            # Not too close to gold mines
+            if any(self._distance(pos, mp) < self.ts * 4 for mp in mine_positions):
+                return False
 
-            if dist_to_nearest < easy_max_dist:
-                difficulty = CreepDifficulty.EASY
-            elif dist_to_nearest < medium_max_dist:
-                difficulty = CreepDifficulty.MEDIUM
-            else:
-                difficulty = CreepDifficulty.HARD
+            # Not too close to other camps
+            if any(self._distance(pos, cp) < min_camp_dist for cp in placed_positions):
+                return False
 
-            if counts[difficulty] >= targets[difficulty]:
-                continue
+            return True
 
-            tile = self._tile_at_world((x, y))
-            position = self._tile_to_world(tile)
+        def find_camp_position(team_id: int, difficulty: CreepDifficulty,
+                               max_attempts: int = 100) -> Vec2 | None:
+            """Find a valid position for a camp near a specific team's territory."""
+            team_spawn_positions = [s.position for s in team_spawns[team_id]]
 
-            camp = CreepCamp(
-                position=position,
-                tile=tile,
-                difficulty=difficulty,
-                distance_to_nearest_spawn=dist_to_nearest
-            )
-            self.creep_camps.append(camp)
-            counts[difficulty] += 1
+            if not team_spawn_positions:
+                return None
+
+            # Calculate team center (average of team spawn positions)
+            team_center_x = sum(p[0] for p in team_spawn_positions) / len(team_spawn_positions)
+            team_center_y = sum(p[1] for p in team_spawn_positions) / len(team_spawn_positions)
+            team_center = (team_center_x, team_center_y)
+
+            cx, cy = self.center
+
+            for _ in range(max_attempts):
+                if difficulty == CreepDifficulty.EASY:
+                    # Easy camps: close to team spawns, in their territory
+                    # Pick a random spawn from this team and place near it
+                    base_spawn = rng.choice(team_spawn_positions)
+                    angle = rng.uniform(0, 2 * math.pi)
+                    dist = rng.uniform(self.ts * 6, easy_max_dist)
+                    x = base_spawn[0] + dist * math.cos(angle)
+                    y = base_spawn[1] + dist * math.sin(angle)
+
+                elif difficulty == CreepDifficulty.MEDIUM:
+                    # Medium camps: between team center and map center
+                    # Interpolate between team center and map center
+                    t = rng.uniform(0.3, 0.7)
+                    base_x = team_center_x + t * (cx - team_center_x)
+                    base_y = team_center_y + t * (cy - team_center_y)
+
+                    # Add some randomness
+                    angle = rng.uniform(0, 2 * math.pi)
+                    offset = rng.uniform(0, self.ts * 8)
+                    x = base_x + offset * math.cos(angle)
+                    y = base_y + offset * math.sin(angle)
+
+                else:  # HARD
+                    # Hard camps: contested center area
+                    # Use gaussian centered on map center
+                    x = rng.gauss(cx, self.width * 0.15)
+                    y = rng.gauss(cy, self.height * 0.15)
+
+                # Clamp to map bounds
+                margin = self.ts * 3
+                x = clamp(x, margin, self.width - margin)
+                y = clamp(y, margin, self.height - margin)
+
+                # Verify distance constraints for difficulty
+                dist_to_team = min(self._distance((x, y), sp) for sp in team_spawn_positions)
+                dist_to_nearest = min(self._distance((x, y), sp) for sp in all_spawn_positions)
+
+                if difficulty == CreepDifficulty.EASY:
+                    # Must be closest to this team and within easy range
+                    if dist_to_team != dist_to_nearest or dist_to_team > easy_max_dist:
+                        continue
+                elif difficulty == CreepDifficulty.MEDIUM:
+                    # Should be in medium range from this team
+                    if dist_to_team > medium_max_dist:
+                        continue
+
+                if is_valid_placement((x, y)):
+                    return (x, y)
+
+            return None
+
+        # Phase 1: Place easy camps for each team
+        for team_id in range(num_teams):
+            for _ in range(easy_per_team):
+                pos = find_camp_position(team_id, CreepDifficulty.EASY)
+                if pos:
+                    tile = self._tile_at_world(pos)
+                    position = self._tile_to_world(tile)
+                    dist = min(self._distance(position, sp) for sp in all_spawn_positions)
+
+                    camp = CreepCamp(
+                        position=position,
+                        tile=tile,
+                        difficulty=CreepDifficulty.EASY,
+                        distance_to_nearest_spawn=dist
+                    )
+                    self.creep_camps.append(camp)
+                    placed_positions.append(position)
+
+        # Phase 2: Place medium camps for each team
+        for team_id in range(num_teams):
+            for _ in range(medium_per_team):
+                pos = find_camp_position(team_id, CreepDifficulty.MEDIUM)
+                if pos:
+                    tile = self._tile_at_world(pos)
+                    position = self._tile_to_world(tile)
+                    dist = min(self._distance(position, sp) for sp in all_spawn_positions)
+
+                    camp = CreepCamp(
+                        position=position,
+                        tile=tile,
+                        difficulty=CreepDifficulty.MEDIUM,
+                        distance_to_nearest_spawn=dist
+                    )
+                    self.creep_camps.append(camp)
+                    placed_positions.append(position)
+
+        # Phase 3: Place hard (contested) camps in center - these are shared
+        for _ in range(hard_total):
+            # For hard camps, pick a random team to use as reference (they're contested anyway)
+            team_id = rng.randint(0, num_teams - 1)
+            pos = find_camp_position(team_id, CreepDifficulty.HARD)
+            if pos:
+                tile = self._tile_at_world(pos)
+                position = self._tile_to_world(tile)
+                dist = min(self._distance(position, sp) for sp in all_spawn_positions)
+
+                camp = CreepCamp(
+                    position=position,
+                    tile=tile,
+                    difficulty=CreepDifficulty.HARD,
+                    distance_to_nearest_spawn=dist
+                )
+                self.creep_camps.append(camp)
+                placed_positions.append(position)
 
     # =========================================================================
     # Phase 4: Terrain Generation
@@ -1180,3 +1309,534 @@ class MyWorld:
             else:
                 gray = int(255 * val)
                 draw_tile(ctx, tile, ts, (gray, gray, gray))
+
+    # =========================================================================
+    # Debug Drawing Methods
+    # =========================================================================
+
+    def _draw_debug_elevation(self, ctx: RenderContext) -> None:
+        """Debug: Visualize raw elevation data as a heatmap."""
+        ts = self.ts
+        for tile in np.ndindex(self.shape_tiles):
+            elev = self.elevation[tile]
+            # Use a color gradient: blue (low) -> green (mid) -> red (high)
+            if elev < 0.5:
+                t = elev * 2
+                color = (0, int(255 * t), int(255 * (1 - t)))
+            else:
+                t = (elev - 0.5) * 2
+                color = (int(255 * t), int(255 * (1 - t)), 0)
+            draw_tile(ctx, tile, ts, color)
+
+        # Draw legend
+        self._draw_legend(ctx, "Elevation", [
+            ((0, 0, 255), "Low (0.0)"),
+            ((0, 255, 0), "Mid (0.5)"),
+            ((255, 0, 0), "High (1.0)"),
+        ])
+
+    def _draw_debug_is_land(self, ctx: RenderContext) -> None:
+        """Debug: Visualize is_land boolean array."""
+        ts = self.ts
+        for tile in np.ndindex(self.shape_tiles):
+            color = (0, 200, 0) if self.is_land[tile] else (0, 0, 200)
+            draw_tile(ctx, tile, ts, color)
+
+        self._draw_legend(ctx, "Is Land", [
+            ((0, 200, 0), "Land"),
+            ((0, 0, 200), "Water"),
+        ])
+
+    def _draw_debug_terrain_type(self, ctx: RenderContext) -> None:
+        """Debug: Visualize terrain_type with distinct colors per type."""
+        ts = self.ts
+        type_colors = {
+            TerrainType.WATER: (0, 0, 200),
+            TerrainType.LAND: (100, 200, 100),
+            TerrainType.FOREST: (0, 100, 0),
+            TerrainType.DENSE_FOREST: (0, 50, 0),
+            TerrainType.CLIFF: (150, 150, 150),
+            TerrainType.RIVER: (50, 100, 255),
+            TerrainType.BRIDGE: (139, 90, 43),
+        }
+
+        for tile in np.ndindex(self.shape_tiles):
+            terrain = TerrainType(self.terrain_type[tile])
+            color = type_colors.get(terrain, (255, 0, 255))
+            draw_tile(ctx, tile, ts, color)
+
+        self._draw_legend(ctx, "Terrain Type", [
+            (type_colors[t], t.name) for t in TerrainType
+        ])
+
+    def _draw_debug_is_trail(self, ctx: RenderContext) -> None:
+        """Debug: Visualize trail tiles."""
+        ts = self.ts
+        for tile in np.ndindex(self.shape_tiles):
+            if self.is_trail[tile]:
+                draw_tile(ctx, tile, ts, (200, 150, 100))
+            else:
+                draw_tile(ctx, tile, ts, (50, 50, 50))
+
+        self._draw_legend(ctx, "Trail Tiles", [
+            ((200, 150, 100), "Trail"),
+            ((50, 50, 50), "No Trail"),
+        ])
+
+    def _draw_debug_is_forest(self, ctx: RenderContext) -> None:
+        """Debug: Visualize forest tiles."""
+        ts = self.ts
+        for tile in np.ndindex(self.shape_tiles):
+            if self.is_forest[tile]:
+                if self.terrain_type[tile] == TerrainType.DENSE_FOREST:
+                    draw_tile(ctx, tile, ts, (0, 80, 0))
+                else:
+                    draw_tile(ctx, tile, ts, (0, 180, 0))
+            else:
+                draw_tile(ctx, tile, ts, (200, 200, 150))
+
+        self._draw_legend(ctx, "Forest Coverage", [
+            ((0, 180, 0), "Forest"),
+            ((0, 80, 0), "Dense Forest"),
+            ((200, 200, 150), "Clear"),
+        ])
+
+    def _draw_debug_spawn_radius(self, ctx: RenderContext) -> None:
+        """Debug: Visualize spawn radius and center point."""
+        ts = self.ts
+        cx, cy = self.center
+        radius = self.spawn_radius
+
+        # Draw base terrain faded
+        for tile in np.ndindex(self.shape_tiles):
+            draw_tile(ctx, tile, ts, (40, 40, 40))
+
+        # Draw spawn radius circle
+        center_screen = ctx.camera.world_to_screen((cx, cy))
+        radius_screen = int(radius * ctx.camera.zoom)
+        pygame.draw.circle(ctx.screen, (255, 255, 0), center_screen, radius_screen, 3)
+
+        # Draw center cross
+        pygame.draw.line(ctx.screen, (255, 0, 0),
+                        (center_screen[0] - 20, center_screen[1]),
+                        (center_screen[0] + 20, center_screen[1]), 2)
+        pygame.draw.line(ctx.screen, (255, 0, 0),
+                        (center_screen[0], center_screen[1] - 20),
+                        (center_screen[0], center_screen[1] + 20), 2)
+
+        # Draw spawns on the circle
+        for spawn in self.spawns:
+            pos = ctx.camera.world_to_screen(spawn.position)
+            team_color = TEAM_COLORS[spawn.team_id % len(TEAM_COLORS)]
+            pygame.draw.circle(ctx.screen, team_color, pos, 10)
+            pygame.draw.circle(ctx.screen, (255, 255, 255), pos, 10, 2)
+
+        self._draw_legend(ctx, "Spawn Radius", [
+            ((255, 255, 0), f"Radius: {radius:.0f}px"),
+            ((255, 0, 0), "Center"),
+        ])
+
+    def _draw_debug_team_angles(self, ctx: RenderContext) -> None:
+        """Debug: Visualize team angles and sectors."""
+        ts = self.ts
+        cx, cy = self.center
+        radius = min(self.width, self.height) * 0.45
+
+        # Draw base
+        for tile in np.ndindex(self.shape_tiles):
+            draw_tile(ctx, tile, ts, (30, 30, 30))
+
+        center_screen = ctx.camera.world_to_screen((cx, cy))
+
+        # Draw team sectors
+        for spawn in self.spawns:
+            team_color = TEAM_COLORS[spawn.team_id % len(TEAM_COLORS)]
+
+            # Draw line from center to spawn
+            spawn_screen = ctx.camera.world_to_screen(spawn.position)
+            pygame.draw.line(ctx.screen, team_color, center_screen, spawn_screen, 2)
+
+            # Draw angle arc
+            angle_deg = math.degrees(spawn.angle)
+            end_x = cx + radius * math.cos(spawn.angle)
+            end_y = cy + radius * math.sin(spawn.angle)
+            end_screen = ctx.camera.world_to_screen((end_x, end_y))
+            pygame.draw.line(ctx.screen, (*team_color[:3],), center_screen, end_screen, 1)
+
+            # Label with angle
+            font = pygame.font.Font(None, 24)
+            label = font.render(f"P{spawn.player_id} T{spawn.team_id} ({angle_deg:.0f}°)", True, (255, 255, 255))
+            ctx.screen.blit(label, (spawn_screen[0] + 15, spawn_screen[1] - 10))
+
+    def _draw_debug_teammate_distances(self, ctx: RenderContext) -> None:
+        """Debug: Visualize distances between teammates."""
+        ts = self.ts
+        cx, cy = self.center
+
+        # Draw base
+        for tile in np.ndindex(self.shape_tiles):
+            draw_tile(ctx, tile, ts, (30, 30, 30))
+
+        # Group by team
+        teams_spawns: dict[int, list[PlayerSpawn]] = defaultdict(list)
+        for spawn in self.spawns:
+            teams_spawns[spawn.team_id].append(spawn)
+
+        # Draw connections between teammates
+        for team_id, team_spawns in teams_spawns.items():
+            team_color = TEAM_COLORS[team_id % len(TEAM_COLORS)]
+
+            for i, s1 in enumerate(team_spawns):
+                p1 = ctx.camera.world_to_screen(s1.position)
+                pygame.draw.circle(ctx.screen, team_color, p1, 12)
+
+                for s2 in team_spawns[i + 1:]:
+                    p2 = ctx.camera.world_to_screen(s2.position)
+                    dist = self._distance(s1.position, s2.position)
+
+                    # Draw line
+                    pygame.draw.line(ctx.screen, team_color, p1, p2, 3)
+
+                    # Draw distance label at midpoint
+                    mid = ((p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2)
+                    font = pygame.font.Font(None, 20)
+                    label = font.render(f"{dist:.0f}", True, (255, 255, 255))
+                    ctx.screen.blit(label, mid)
+
+    def _draw_debug_dijkstra_distances(self, ctx: RenderContext) -> None:
+        """Debug: Visualize Dijkstra distances from first spawn."""
+        if not self.spawns:
+            return
+
+        ts = self.ts
+        shape = self.shape_tiles
+
+        # Run Dijkstra from first spawn
+        start = self.spawns[0].tile
+
+        def passable(x: int, y: int) -> bool:
+            if not self.is_tile_in_bounds((x, y)):
+                return False
+            return self.is_land[x, y]
+
+        def cost_of(x: int, y: int, nx: int, ny: int) -> float:
+            if not self.is_tile_in_bounds((nx, ny)):
+                return float('inf')
+            base = 1.0
+            if self.elevation[nx, ny] > 0.7:
+                base = 2.5
+            elif self.elevation[nx, ny] > 0.5:
+                base = 1.5
+            if self.is_trail[nx, ny]:
+                base *= self.cfg.trail_cost_reduction
+            return base
+
+        distances, _ = dijkstra_grid(shape[0], shape[1], passable, cost_of, start)
+
+        # Normalize and visualize
+        max_dist = np.nanmax(distances[np.isfinite(distances)])
+        if max_dist == 0:
+            max_dist = 1
+
+        for tile in np.ndindex(shape):
+            d = distances[tile[1], tile[0]]
+            if np.isinf(d):
+                draw_tile(ctx, tile, ts, (100, 0, 0))  # Unreachable
+            else:
+                t = clamp(d / max_dist, 0, 1)
+                # Blue (close) -> Yellow (mid) -> Red (far)
+                if t < 0.5:
+                    color = (int(255 * t * 2), int(255 * t * 2), int(255 * (1 - t * 2)))
+                else:
+                    color = (255, int(255 * (1 - (t - 0.5) * 2)), 0)
+                draw_tile(ctx, tile, ts, color)
+
+        # Mark start
+        start_screen = ctx.camera.world_to_screen(self._tile_to_world(start))
+        pygame.draw.circle(ctx.screen, (0, 255, 0), start_screen, 10, 3)
+
+        self._draw_legend(ctx, "Dijkstra Distance", [
+            ((0, 0, 255), "Close"),
+            ((255, 255, 0), "Mid"),
+            ((255, 0, 0), "Far"),
+            ((100, 0, 0), "Unreachable"),
+        ])
+
+    def _draw_debug_trail_costs(self, ctx: RenderContext) -> None:
+        """Debug: Visualize movement cost map including trail bonuses."""
+        ts = self.ts
+
+        for tile in np.ndindex(self.shape_tiles):
+            if not self.is_land[tile]:
+                draw_tile(ctx, tile, ts, (0, 0, 100))  # Water
+                continue
+
+            # Calculate cost
+            base = 1.0
+            if self.elevation[tile] > 0.7:
+                base = 2.5
+            elif self.elevation[tile] > 0.5:
+                base = 1.5
+
+            if self.is_trail[tile]:
+                base *= self.cfg.trail_cost_reduction
+
+            # Color based on cost
+            if base <= 0.7:
+                color = (100, 255, 100)  # Trail bonus
+            elif base <= 1.0:
+                color = (200, 200, 200)  # Normal
+            elif base <= 1.5:
+                color = (255, 200, 100)  # Slightly elevated
+            else:
+                color = (255, 100, 100)  # High cost
+
+            draw_tile(ctx, tile, ts, color)
+
+        self._draw_legend(ctx, "Movement Cost", [
+            ((100, 255, 100), f"Trail ({self.cfg.trail_cost_reduction})"),
+            ((200, 200, 200), "Normal (1.0)"),
+            ((255, 200, 100), "Elevated (1.5)"),
+            ((255, 100, 100), "High (2.5)"),
+            ((0, 0, 100), "Impassable"),
+        ])
+
+    def _draw_debug_forest_density(self, ctx: RenderContext) -> None:
+        """Debug: Visualize forest neighbor counts (CA debug)."""
+        ts = self.ts
+        shape = self.shape_tiles
+
+        for x in range(shape[0]):
+            for y in range(shape[1]):
+                if not self.is_land[x, y]:
+                    draw_tile(ctx, (x, y), ts, (0, 0, 50))
+                    continue
+
+                # Count forest neighbors
+                neighbors = 0
+                for dx in range(-1, 2):
+                    for dy in range(-1, 2):
+                        if dx == 0 and dy == 0:
+                            continue
+                        nx, ny = x + dx, y + dy
+                        if self.is_tile_in_bounds((nx, ny)) and self.is_forest[nx, ny]:
+                            neighbors += 1
+
+                # Color based on neighbor count (0-8)
+                intensity = neighbors / 8
+                if self.is_forest[x, y]:
+                    color = (0, int(100 + 155 * intensity), 0)
+                else:
+                    color = (int(50 + 100 * intensity), int(50 + 100 * intensity), int(50 + 50 * intensity))
+
+                draw_tile(ctx, (x, y), ts, color)
+
+        self._draw_legend(ctx, "Forest Neighbors (CA)", [
+            ((0, 100, 0), "Forest, few neighbors"),
+            ((0, 255, 0), "Forest, many neighbors"),
+            ((50, 50, 50), "Clear, few neighbors"),
+            ((150, 150, 100), "Clear, many neighbors"),
+        ])
+
+    def _draw_debug_boundary_zones(self, ctx: RenderContext) -> None:
+        """Debug: Visualize team boundary zones."""
+        ts = self.ts
+        cx, cy = self.center
+
+        if len(self.cfg.teams) < 2:
+            return
+
+        # Get boundary angles
+        team_angles = {}
+        for spawn in self.spawns:
+            if spawn.team_id not in team_angles:
+                team_angles[spawn.team_id] = spawn.angle
+
+        sorted_teams = sorted(team_angles.items(), key=lambda x: x[1])
+        boundary_angles = []
+
+        for i in range(len(sorted_teams)):
+            _, angle1 = sorted_teams[i]
+            _, angle2 = sorted_teams[(i + 1) % len(sorted_teams)]
+            if angle2 < angle1:
+                angle2 += 2 * math.pi
+            mid_angle = (angle1 + angle2) / 2
+            if mid_angle > 2 * math.pi:
+                mid_angle -= 2 * math.pi
+            boundary_angles.append(mid_angle)
+
+        # Color tiles based on proximity to boundaries
+        for tile in np.ndindex(self.shape_tiles):
+            pos = self._tile_to_world(tile)
+            dx, dy = pos[0] - cx, pos[1] - cy
+            tile_angle = math.atan2(dy, dx)
+            if tile_angle < 0:
+                tile_angle += 2 * math.pi
+
+            # Find nearest boundary
+            min_angle_diff = float('inf')
+            for ba in boundary_angles:
+                diff = abs(tile_angle - ba)
+                diff = min(diff, 2 * math.pi - diff)
+                min_angle_diff = min(min_angle_diff, diff)
+
+            # Color based on proximity to boundary (closer = brighter)
+            boundary_threshold = math.radians(15)  # 15 degrees
+            if min_angle_diff < boundary_threshold:
+                intensity = 1 - (min_angle_diff / boundary_threshold)
+                color = (int(255 * intensity), 0, int(255 * intensity))
+            else:
+                color = (30, 30, 30)
+
+            draw_tile(ctx, tile, ts, color)
+
+        # Draw boundary lines
+        center_screen = ctx.camera.world_to_screen((cx, cy))
+        radius = min(self.width, self.height) * 0.5
+        for angle in boundary_angles:
+            end_x = cx + radius * math.cos(angle)
+            end_y = cy + radius * math.sin(angle)
+            end_screen = ctx.camera.world_to_screen((end_x, end_y))
+            pygame.draw.line(ctx.screen, (255, 255, 0), center_screen, end_screen, 2)
+
+        self._draw_legend(ctx, "Boundary Zones", [
+            ((255, 0, 255), "Near boundary"),
+            ((255, 255, 0), "Boundary line"),
+        ])
+
+    def _draw_debug_separator_areas(self, ctx: RenderContext) -> None:
+        """Debug: Visualize where separators (rivers, cliffs, forests) are placed."""
+        ts = self.ts
+
+        for tile in np.ndindex(self.shape_tiles):
+            terrain = self.terrain_type[tile]
+
+            if terrain == TerrainType.RIVER:
+                color = (0, 100, 255)
+            elif terrain == TerrainType.BRIDGE:
+                color = (200, 150, 50)
+            elif terrain == TerrainType.CLIFF:
+                color = (200, 200, 200)
+            elif terrain == TerrainType.DENSE_FOREST:
+                color = (0, 100, 0)
+            elif self.is_forest[tile]:
+                color = (50, 80, 50)
+            elif self.is_land[tile]:
+                color = (80, 80, 60)
+            else:
+                color = (30, 30, 60)
+
+            draw_tile(ctx, tile, ts, color)
+
+        # Highlight rivers and bridges
+        for river in self.rivers:
+            for bridge_tile in river.bridge_tiles:
+                center = ctx.camera.world_to_screen(self._tile_to_world(bridge_tile))
+                pygame.draw.circle(ctx.screen, (255, 200, 0), center, 8, 2)
+
+        # Highlight cliff passes
+        for cliff in self.cliffs:
+            for pass_tile in cliff.pass_tiles:
+                center = ctx.camera.world_to_screen(self._tile_to_world(pass_tile))
+                pygame.draw.circle(ctx.screen, (0, 255, 0), center, 8, 2)
+
+        self._draw_legend(ctx, "Separator Areas", [
+            ((0, 100, 255), "River"),
+            ((200, 150, 50), "Bridge"),
+            ((200, 200, 200), "Cliff"),
+            ((0, 100, 0), "Dense Forest"),
+        ])
+
+    def _draw_debug_creep_zones(self, ctx: RenderContext) -> None:
+        """Debug: Visualize creep difficulty zones based on spawn distance."""
+        ts = self.ts
+        spawn_positions = [s.position for s in self.spawns]
+
+        if not spawn_positions:
+            return
+
+        easy_max = self.spawn_radius * 0.4
+        medium_max = self.spawn_radius * 0.8
+
+        for tile in np.ndindex(self.shape_tiles):
+            pos = self._tile_to_world(tile)
+            min_dist = min(self._distance(pos, sp) for sp in spawn_positions)
+
+            if min_dist < easy_max:
+                color = COLOR_CREEP_EASY
+            elif min_dist < medium_max:
+                color = COLOR_CREEP_MEDIUM
+            else:
+                color = COLOR_CREEP_HARD
+
+            # Fade based on actual distance within zone
+            draw_tile(ctx, tile, ts, color)
+
+        # Draw actual creep camps
+        for camp in self.creep_camps:
+            center = ctx.camera.world_to_screen(camp.position)
+            pygame.draw.circle(ctx.screen, (255, 255, 255), center, 8, 3)
+
+        self._draw_legend(ctx, "Creep Difficulty Zones", [
+            (COLOR_CREEP_EASY, f"Easy (<{easy_max:.0f}px)"),
+            (COLOR_CREEP_MEDIUM, f"Medium (<{medium_max:.0f}px)"),
+            (COLOR_CREEP_HARD, "Hard"),
+        ])
+
+    def _draw_debug_team_territories(self, ctx: RenderContext) -> None:
+        """Debug: Visualize which team 'owns' each tile based on proximity."""
+        ts = self.ts
+
+        if not self.spawns:
+            return
+
+        for tile in np.ndindex(self.shape_tiles):
+            pos = self._tile_to_world(tile)
+
+            # Find nearest spawn
+            nearest_spawn = min(self.spawns, key=lambda s: self._distance(pos, s.position))
+            team_color = TEAM_COLORS[nearest_spawn.team_id % len(TEAM_COLORS)]
+
+            # Fade based on distance
+            dist = self._distance(pos, nearest_spawn.position)
+            max_dist = self.spawn_radius * 1.5
+            fade = 1 - clamp(dist / max_dist, 0, 0.7)
+
+            color = tuple(int(c * fade) for c in team_color)
+            draw_tile(ctx, tile, ts, color)
+
+        # Draw spawn markers
+        for spawn in self.spawns:
+            center = ctx.camera.world_to_screen(spawn.position)
+            team_color = TEAM_COLORS[spawn.team_id % len(TEAM_COLORS)]
+            pygame.draw.circle(ctx.screen, (255, 255, 255), center, 12, 3)
+            pygame.draw.circle(ctx.screen, team_color, center, 8)
+
+    def _draw_legend(self, ctx: RenderContext, title: str, items: list[tuple[Color, str]]) -> None:
+        """Draw a legend box in the corner of the screen."""
+        font = pygame.font.Font(None, 20)
+        title_font = pygame.font.Font(None, 24)
+
+        padding = 10
+        line_height = 22
+        box_size = 14
+        max_width = 200
+
+        # Calculate box dimensions
+        height = padding * 2 + line_height * (len(items) + 1)
+
+        # Draw background
+        x, y = 10, 10
+        pygame.draw.rect(ctx.screen, (20, 20, 20), (x, y, max_width, height))
+        pygame.draw.rect(ctx.screen, (100, 100, 100), (x, y, max_width, height), 1)
+
+        # Draw title
+        title_surface = title_font.render(title, True, (255, 255, 255))
+        ctx.screen.blit(title_surface, (x + padding, y + padding))
+
+        # Draw items
+        for i, (color, label) in enumerate(items):
+            item_y = y + padding + line_height * (i + 1)
+            pygame.draw.rect(ctx.screen, color, (x + padding, item_y + 2, box_size, box_size))
+            label_surface = font.render(label, True, (200, 200, 200))
+            ctx.screen.blit(label_surface, (x + padding + box_size + 8, item_y))

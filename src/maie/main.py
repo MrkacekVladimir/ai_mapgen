@@ -14,15 +14,17 @@ def main():
     # cfg.tileset = "city"
     # world = WfcWorld(cfg)
     
+    # Shared config that persists between regenerations (team settings are kept)
+    cfg = MyWorldConfig()
+    
     # Factory function to create new worlds (used for regeneration with 'R' key)
     def create_world():
-        cfg = MyWorldConfig()
         cfg.seed = random.randint(0, 2**31 - 1)
-        print(f"Using seed: {cfg.seed}")
+        print(f"Using seed: {cfg.seed} | Teams: {cfg.teams}")
         return MyWorld(cfg)
     
     world = create_world()
-    pg = Playground2D(world, world_factory=create_world)
+    pg = Playground2D(world, world_factory=create_world, world_config=cfg)
     pg.run()
 
 

@@ -15,6 +15,12 @@ class CfgLike(Protocol):
     height: int
     tile_size: float
 
+
+class TeamCfgLike(Protocol):
+    """Protocol for configs that support team configuration."""
+    teams: list[int]
+
+
 class WorldLike(Protocol):
     cfg: CfgLike
 
@@ -33,9 +39,33 @@ HUD_FONT_COLOR = (220, 220, 220)
 FILL_COLOR = (18, 18, 18)
 COLOR_AXES = (90, 90, 90)
 
+# Layer names for UI panel (indices 0-9 are regular layers, 10-11 are debug)
+LAYER_NAMES = [
+    "Border",
+    "Terrain",
+    "Forests",
+    "Rivers",
+    "Cliffs",
+    "Trails",
+    "Spawn Zones",
+    "Spawns",
+    "Gold Mines",
+    "Creep Camps",
+]
+COLOR_LAYER_ON = (100, 220, 100)
+COLOR_LAYER_OFF = (100, 100, 100)
+
 
 class Playground2D:
-    def __init__(self, world: WorldLike, w: int = 1920, h: int = 1080, name="uuWorld", world_factory: Callable[[], WorldLike] | None = None) -> None:
+    def __init__(
+        self,
+        world: WorldLike,
+        w: int = 1920,
+        h: int = 1080,
+        name="uuWorld",
+        world_factory: Callable[[], WorldLike] | None = None,
+        world_config: TeamCfgLike | None = None,
+    ) -> None:
         pygame.display.set_caption(name)
         self.screen = pygame.display.set_mode((w, h))
         self.clock = pygame.time.Clock()
@@ -44,7 +74,8 @@ class Playground2D:
         self.cam = Camera2D(offset=pygame.Vector2(0, 0), zoom=1.0)
         self.world = world
         self.world_factory = world_factory
-        self.layers_to_draw = []
+        self.world_config = world_config  # Shared config for team adjustments
+        self.layers_to_draw = list(range(10))  # All non-debug layers on by default
 
         self.tile_size = world.cfg.tile_size
         self.show_grid = True
@@ -112,9 +143,57 @@ class Playground2D:
         surf = HUD_FONT.render(text, True, HUD_FONT_COLOR)
         ctx.screen.blit(surf, (10, 10))
 
-        help1 = "LMB drag: pan | Wheel: zoom | G: grid | A: axes | D: debug mode | TAB: cycle layers | R: regenerate | ESC: quit"
+        # Team configuration line
+        if self.world_config is not None:
+            teams = self.world_config.teams
+            num_teams = len(teams)
+            players_per_team = teams[0] if teams else 1
+            total_players = sum(teams)
+            team_text = f"Teams: {num_teams}x{players_per_team} ({total_players} players) | T/Shift+T: teams | P/Shift+P: players | R: regenerate"
+            surf_teams = HUD_FONT.render(team_text, True, HUD_FONT_COLOR)
+            ctx.screen.blit(surf_teams, (10, 30))
+            help_y = 50
+        else:
+            help_y = 30
+
+        help1 = "LMB drag: pan | Wheel: zoom | G: grid | A: axes | D: debug mode | TAB: cycle layers | S: save | ESC: quit"
         surf2 = HUD_FONT.render(help1, True, HUD_FONT_COLOR_2)
-        ctx.screen.blit(surf2, (10, 30))
+        ctx.screen.blit(surf2, (10, help_y))
+
+        # Right panel - Layer status
+        self._draw_layer_panel(ctx)
+
+    def _draw_layer_panel(self, ctx: RenderContext) -> None:
+        """Draw the layer status panel on the right side of the screen."""
+        screen_w, screen_h = ctx.screen.get_size()
+        panel_x = screen_w - 180
+        panel_y = 10
+        line_height = 22
+
+        # Panel header
+        header = HUD_FONT.render("LAYERS", True, HUD_FONT_COLOR)
+        ctx.screen.blit(header, (panel_x, panel_y))
+        panel_y += line_height
+
+        # Separator line
+        pygame.draw.line(
+            ctx.screen,
+            HUD_FONT_COLOR_2,
+            (panel_x, panel_y),
+            (panel_x + 160, panel_y),
+            1
+        )
+        panel_y += 8
+
+        # Layer entries
+        for idx, name in enumerate(LAYER_NAMES):
+            is_on = idx in self.layers_to_draw
+            color = COLOR_LAYER_ON if is_on else COLOR_LAYER_OFF
+            status = "ON" if is_on else "OFF"
+            text = f"[{idx}] {name:<12} {status}"
+            surf = HUD_FONT.render(text, True, color)
+            ctx.screen.blit(surf, (panel_x, panel_y))
+            panel_y += line_height
 
     # --- events ---
     def _handle_event(self, e: pygame.event.Event) -> None:
@@ -144,6 +223,10 @@ class Playground2D:
                 self.save()
             if e.key == pygame.K_r:
                 self._regenerate_world()
+            if e.key == pygame.K_t:
+                self._adjust_teams(e)
+            if e.key == pygame.K_p:
+                self._adjust_players(e)
 
         if e.type == pygame.MOUSEBUTTONDOWN:
             if e.button == 1:  # MMB pan
@@ -196,6 +279,46 @@ class Playground2D:
         self.debug_layers = self.world.debug_layers()
         self.current_layer = 0
         print("World regenerated!")
+
+    def _adjust_teams(self, e: pygame.event.Event) -> None:
+        """Adjust number of teams with T (add) / Shift+T (remove)."""
+        if self.world_config is None:
+            return
+        mods = pygame.key.get_mods()
+        teams = self.world_config.teams
+        players_per_team = teams[0] if teams else 1
+
+        if mods & pygame.KMOD_SHIFT:
+            # Remove a team (min 1)
+            if len(teams) > 1:
+                self.world_config.teams = teams[:-1]
+                print(f"Teams: {len(self.world_config.teams)}x{players_per_team}")
+        else:
+            # Add a team (max 8)
+            if len(teams) < 8:
+                self.world_config.teams = teams + [players_per_team]
+                print(f"Teams: {len(self.world_config.teams)}x{players_per_team}")
+
+    def _adjust_players(self, e: pygame.event.Event) -> None:
+        """Adjust players per team with P (add) / Shift+P (remove)."""
+        if self.world_config is None:
+            return
+        mods = pygame.key.get_mods()
+        teams = self.world_config.teams
+        players_per_team = teams[0] if teams else 1
+
+        if mods & pygame.KMOD_SHIFT:
+            # Remove a player per team (min 1)
+            if players_per_team > 1:
+                new_ppt = players_per_team - 1
+                self.world_config.teams = [new_ppt] * len(teams)
+                print(f"Teams: {len(teams)}x{new_ppt}")
+        else:
+            # Add a player per team (max 4)
+            if players_per_team < 4:
+                new_ppt = players_per_team + 1
+                self.world_config.teams = [new_ppt] * len(teams)
+                print(f"Teams: {len(teams)}x{new_ppt}")
 
     def run(self, fps: int = 30) -> None:
         while True:
