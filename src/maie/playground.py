@@ -35,7 +35,7 @@ COLOR_AXES = (90, 90, 90)
 
 
 class Playground2D:
-    def __init__(self, world: WorldLike, w: int = 1920, h: int = 1080, name="uuWorld") -> None:
+    def __init__(self, world: WorldLike, w: int = 1920, h: int = 1080, name="uuWorld", world_factory: Callable[[], WorldLike] | None = None) -> None:
         pygame.display.set_caption(name)
         self.screen = pygame.display.set_mode((w, h))
         self.clock = pygame.time.Clock()
@@ -43,6 +43,7 @@ class Playground2D:
 
         self.cam = Camera2D(offset=pygame.Vector2(0, 0), zoom=1.0)
         self.world = world
+        self.world_factory = world_factory
         self.layers_to_draw = []
 
         self.tile_size = world.cfg.tile_size
@@ -111,7 +112,7 @@ class Playground2D:
         surf = HUD_FONT.render(text, True, HUD_FONT_COLOR)
         ctx.screen.blit(surf, (10, 10))
 
-        help1 = "LMB drag: pan | Wheel: zoom | G: grid | A: axes | D: debug mode | TAB: cycle debug layers | ESC: quit"
+        help1 = "LMB drag: pan | Wheel: zoom | G: grid | A: axes | D: debug mode | TAB: cycle layers | R: regenerate | ESC: quit"
         surf2 = HUD_FONT.render(help1, True, HUD_FONT_COLOR_2)
         ctx.screen.blit(surf2, (10, 30))
 
@@ -141,6 +142,8 @@ class Playground2D:
                     self.layers_to_draw.append(val)
             if e.key == pygame.K_s:
                 self.save()
+            if e.key == pygame.K_r:
+                self._regenerate_world()
 
         if e.type == pygame.MOUSEBUTTONDOWN:
             if e.button == 1:  # MMB pan
@@ -182,6 +185,17 @@ class Playground2D:
         now = datetime.now().strftime("%Y%m%d_%H%M%S")
         pygame.image.save(ctx.screen, f"{self.name}_{now}.jpg")
 
+    def _regenerate_world(self) -> None:
+        """Regenerate the world using the factory function if available."""
+        if self.world_factory is None:
+            print("No world factory set - cannot regenerate")
+            return
+        print("Regenerating world...")
+        self.world = self.world_factory()
+        self.tile_size = self.world.cfg.tile_size
+        self.debug_layers = self.world.debug_layers()
+        self.current_layer = 0
+        print("World regenerated!")
 
     def run(self, fps: int = 30) -> None:
         while True:
