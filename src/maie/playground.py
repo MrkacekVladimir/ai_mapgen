@@ -60,8 +60,8 @@ class Playground2D:
     def __init__(
         self,
         world: WorldLike,
-        w: int = 1920,
-        h: int = 1080,
+        w: int = 1280,
+        h: int = 720,
         name="uuWorld",
         world_factory: Callable[[], WorldLike] | None = None,
         world_config: TeamCfgLike | None = None,

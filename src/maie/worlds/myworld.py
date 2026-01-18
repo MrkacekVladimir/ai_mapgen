@@ -33,12 +33,15 @@ from maie.poisson import poisson_disc_2d
 class TerrainType(IntEnum):
     """Terrain types for the map."""
     WATER = 0
-    LAND = 1
-    FOREST = 2
-    DENSE_FOREST = 3
-    CLIFF = 4
-    RIVER = 5
-    BRIDGE = 6
+    SHALLOW_WATER = 1
+    SAND = 2
+    GRASS = 3
+    LAND = 4  # Dirt/default
+    FOREST = 5
+    DENSE_FOREST = 6
+    CLIFF = 7
+    RIVER = 8
+    BRIDGE = 9
 
 
 class CreepDifficulty(IntEnum):
@@ -66,16 +69,19 @@ class ViewLayers(IntEnum):
 # Colors
 # =============================================================================
 COLOR_WORLD_EDGE = (150, 0, 0)
-COLOR_LAND = (34, 139, 34)           # Forest green
 COLOR_WATER = (30, 60, 120)          # Deep blue
+COLOR_SHALLOW_WATER = (70, 130, 180) # Steel blue
+COLOR_SAND = (210, 180, 140)         # Tan/sandy
+COLOR_GRASS = (34, 139, 34)          # Forest green
+COLOR_LAND = (139, 119, 101)         # Dirt brown
 COLOR_SPAWN = (255, 215, 0)          # Gold for player spawns
 COLOR_GOLD_MINE = (255, 200, 0)      # Yellow-gold
 COLOR_GOLD_MINE_NEUTRAL = (218, 165, 32)  # Goldenrod for neutral mines
 
 # Terrain feature colors
-COLOR_FOREST = (20, 90, 20)          # Dark forest green
-COLOR_DENSE_FOREST = (10, 50, 10)    # Very dark forest
-COLOR_TRAIL = (139, 119, 101)        # Light brown trail
+COLOR_FOREST = (28, 110, 28)         # Forest green (slightly darker than grass)
+COLOR_DENSE_FOREST = (15, 60, 15)    # Very dark forest
+COLOR_TRAIL = (160, 140, 120)        # Light brown trail
 COLOR_RIVER = (65, 105, 225)         # Royal blue water
 COLOR_BRIDGE = (139, 90, 43)         # Brown wood
 COLOR_CLIFF = (105, 105, 105)        # Gray rock
@@ -104,8 +110,8 @@ TEAM_COLORS = [
 @dataclass
 class MyWorldConfig:
     """Configuration for WC3-style strategy game map generation."""
-    width: int = 1920
-    height: int = 1080
+    width: int = 2500
+    height: int = 2500
     tile_size: float = 16.0
     seed: int = 42
 
@@ -115,6 +121,8 @@ class MyWorldConfig:
     # Spawn placement
     spawn_radius_ratio: float = 0.35   # How far from center (0.0-0.5)
     teammate_arc_degrees: float = 30   # Angle spread for teammates
+    spawn_random_offset: float = 200.0 # Max random offset from radial position (pixels)
+    spawn_zone_margin: float = 32.0    # Extra margin between spawn zones (pixels)
 
     # Gold mines
     gold_mines_per_player: int = 1     # Starting mines per player
@@ -128,6 +136,14 @@ class MyWorldConfig:
     # Terrain
     land_ratio: float = 0.85           # How much of the map should be land
     spawn_flat_radius: int = 8         # Tiles around spawn guaranteed flat
+
+    # Biome variety (Poisson-based)
+    biome_point_radius: float = 200.0  # Min distance between biome seed points
+    biome_blend_noise: float = 0.3     # Noise factor for organic biome boundaries
+    biome_grass_weight: float = 0.70   # Weight for grass biome (dominant)
+    biome_sand_weight: float = 0.10    # Weight for sand biome (rare)
+    biome_land_weight: float = 0.20    # Weight for dirt/land biome
+    shallow_water_width: int = 1       # Width of shallow water along coastlines (tiles)
 
     # Phase 5: Trails
     trail_cost_reduction: float = 0.7  # Movement cost on trails
@@ -262,12 +278,12 @@ class MyWorld:
     def debug_layers(self) -> list[DrawLayer]:
         """Get comprehensive debug visualization layers."""
         return [
-            # === Raw Terrain Data ===
-            DrawLayer(z=100, label="dbg_elevation", draw=self._draw_debug_elevation),
-            DrawLayer(z=101, label="dbg_is_land", draw=self._draw_debug_is_land),
-            DrawLayer(z=102, label="dbg_terrain_type", draw=self._draw_debug_terrain_type),
-            DrawLayer(z=103, label="dbg_is_trail", draw=self._draw_debug_is_trail),
-            DrawLayer(z=104, label="dbg_is_forest", draw=self._draw_debug_is_forest),
+            # # === Raw Terrain Data ===
+            # DrawLayer(z=100, label="dbg_elevation", draw=self._draw_debug_elevation),
+            # DrawLayer(z=101, label="dbg_is_land", draw=self._draw_debug_is_land),
+            # DrawLayer(z=102, label="dbg_terrain_type", draw=self._draw_debug_terrain_type),
+            # DrawLayer(z=103, label="dbg_is_trail", draw=self._draw_debug_is_trail),
+            # DrawLayer(z=104, label="dbg_is_forest", draw=self._draw_debug_is_forest),
 
             # === Spawn Analysis ===
             DrawLayer(z=110, label="dbg_spawn_radius", draw=self._draw_debug_spawn_radius),
@@ -285,10 +301,10 @@ class MyWorld:
             DrawLayer(z=140, label="dbg_boundary_zones", draw=self._draw_debug_boundary_zones),
             DrawLayer(z=141, label="dbg_separator_areas", draw=self._draw_debug_separator_areas),
 
-            # === Distance-based Analysis ===
-            DrawLayer(z=150, label="dbg_spawn_distances", draw=self._draw_debug_distances),
-            DrawLayer(z=151, label="dbg_creep_zones", draw=self._draw_debug_creep_zones),
-            DrawLayer(z=152, label="dbg_team_territories", draw=self._draw_debug_team_territories),
+            # # === Distance-based Analysis ===
+            # DrawLayer(z=150, label="dbg_spawn_distances", draw=self._draw_debug_distances),
+            # DrawLayer(z=151, label="dbg_creep_zones", draw=self._draw_debug_creep_zones),
+            # DrawLayer(z=152, label="dbg_team_territories", draw=self._draw_debug_team_territories),
         ]
 
     # =========================================================================
@@ -340,12 +356,12 @@ class MyWorld:
     def _regenerate(self):
         """Run the complete generation pipeline."""
         self._generate_spawns()
-        self._generate_gold_mines()
-        self._generate_creep_camps()
         self._generate_terrain()           # Phase 4: Base terrain
         self._generate_trails()            # Phase 5: Trails between teammates
         self._generate_team_separators()   # Phase 7: Rivers, cliffs, dense forests
         self._generate_forests()           # Phase 6: Forest coverage (respects trails/separators)
+        self._generate_gold_mines()        # Phase 2: Gold mines (after terrain for validation)
+        self._generate_creep_camps()       # Phase 3: Creep camps (after terrain for validation)
 
     # =========================================================================
     # Phase 1: Radial Spawn Point Generation
@@ -386,8 +402,60 @@ class MyWorld:
                 angles = [start_angle + i * angle_step for i in range(team_size)]
 
             for angle in angles:
-                x = cx + radius * math.cos(angle)
-                y = cy + radius * math.sin(angle)
+                # Reference point from radial calculation
+                ref_x = cx + radius * math.cos(angle)
+                ref_y = cy + radius * math.sin(angle)
+
+                # Try to find a valid position with random offset
+                max_attempts = 50
+                best_x, best_y = ref_x, ref_y
+
+                # Spawn zones must not overlap: min distance = 2 * spawn_flat_radius + margin
+                min_spawn_dist = 2 * self.cfg.spawn_flat_radius * self.ts + self.cfg.spawn_zone_margin
+
+                def is_valid_spawn_position(px: float, py: float) -> bool:
+                    """Check if position doesn't overlap with existing spawn zones."""
+                    for existing_spawn in self.spawns:
+                        dist = self._distance((px, py), existing_spawn.position)
+                        if dist < min_spawn_dist:
+                            return False
+                    return True
+
+                if self.cfg.spawn_random_offset > 0:
+                    for attempt in range(max_attempts):
+                        # Add random offset (uniform distribution in circle)
+                        r = math.sqrt(rng.random()) * self.cfg.spawn_random_offset
+                        theta = rng.uniform(0, 2 * math.pi)
+                        candidate_x = ref_x + r * math.cos(theta)
+                        candidate_y = ref_y + r * math.sin(theta)
+                        # Clamp to map bounds
+                        candidate_x = clamp(candidate_x, self.ts, self.cfg.width - self.ts)
+                        candidate_y = clamp(candidate_y, self.ts, self.cfg.height - self.ts)
+
+                        if is_valid_spawn_position(candidate_x, candidate_y):
+                            best_x, best_y = candidate_x, candidate_y
+                            break
+                    else:
+                        # All random attempts failed, try reference position
+                        if is_valid_spawn_position(ref_x, ref_y):
+                            best_x, best_y = ref_x, ref_y
+                        # If reference also overlaps, keep searching outward
+                        else:
+                            for search_dist in range(1, 20):
+                                for search_angle in range(8):
+                                    angle_rad = search_angle * math.pi / 4
+                                    search_x = ref_x + search_dist * self.ts * math.cos(angle_rad)
+                                    search_y = ref_y + search_dist * self.ts * math.sin(angle_rad)
+                                    search_x = clamp(search_x, self.ts, self.cfg.width - self.ts)
+                                    search_y = clamp(search_y, self.ts, self.cfg.height - self.ts)
+                                    if is_valid_spawn_position(search_x, search_y):
+                                        best_x, best_y = search_x, search_y
+                                        break
+                                else:
+                                    continue
+                                break
+
+                x, y = best_x, best_y
 
                 tile = self._tile_at_world((x, y))
                 position = self._tile_to_world(tile)
@@ -412,6 +480,12 @@ class MyWorld:
 
         cx, cy = self.center
 
+        # Define invalid terrain for mines
+        invalid_terrain = {
+            TerrainType.WATER, TerrainType.RIVER, TerrainType.CLIFF,
+            TerrainType.FOREST, TerrainType.DENSE_FOREST
+        }
+
         # 1. Starting mines for each player
         for spawn in self.spawns:
             for _ in range(self.cfg.gold_mines_per_player):
@@ -419,19 +493,47 @@ class MyWorld:
                 dy = cy - spawn.position[1]
                 dist = math.sqrt(dx * dx + dy * dy)
 
-                if dist > 0:
-                    offset = self.cfg.gold_mine_offset_tiles * self.ts
-                    mx = spawn.position[0] + (dx / dist) * offset
-                    my = spawn.position[1] + (dy / dist) * offset
-                else:
-                    mx, my = spawn.position
+                base_offset = self.cfg.gold_mine_offset_tiles * self.ts
 
-                tile = self._tile_at_world((mx, my))
-                position = self._tile_to_world(tile)
+                # Try to find a valid position, searching in a spiral pattern
+                best_tile = None
+                best_position = None
+                for attempt in range(20):
+                    # Vary offset slightly each attempt
+                    offset = base_offset + (attempt * self.ts * 0.5)
+                    angle_offset = (attempt % 4) * (math.pi / 8)  # Rotate slightly
+
+                    if dist > 0:
+                        base_angle = math.atan2(dy, dx)
+                        mx = spawn.position[0] + offset * math.cos(base_angle + angle_offset)
+                        my = spawn.position[1] + offset * math.sin(base_angle + angle_offset)
+                    else:
+                        mx, my = spawn.position
+
+                    tile = self._tile_at_world((mx, my))
+
+                    # Check terrain validity
+                    if self.terrain_type is not None:
+                        terrain = self.terrain_type[tile]
+                        if terrain in invalid_terrain:
+                            continue
+
+                    best_tile = tile
+                    best_position = self._tile_to_world(tile)
+                    break
+                else:
+                    # Fallback: use original position if no valid spot found
+                    if dist > 0:
+                        mx = spawn.position[0] + (dx / dist) * base_offset
+                        my = spawn.position[1] + (dy / dist) * base_offset
+                    else:
+                        mx, my = spawn.position
+                    best_tile = self._tile_at_world((mx, my))
+                    best_position = self._tile_to_world(best_tile)
 
                 mine = GoldMine(
-                    position=position,
-                    tile=tile,
+                    position=best_position,
+                    tile=best_tile,
                     is_starting=True,
                     owner_player=spawn.player_id
                 )
@@ -471,6 +573,13 @@ class MyWorld:
                 continue
 
             tile = self._tile_at_world((x, y))
+
+            # Check terrain type - reject invalid terrain
+            if self.terrain_type is not None:
+                terrain = self.terrain_type[tile]
+                if terrain in invalid_terrain:
+                    continue
+
             position = self._tile_to_world(tile)
 
             mine = GoldMine(
@@ -524,8 +633,20 @@ class MyWorld:
             if min_camp_dist is None:
                 min_camp_dist = self.ts * 6
 
-            # Not too close to any spawn
-            if any(self._distance(pos, sp) < self.ts * 5 for sp in all_spawn_positions):
+            # Check terrain type - reject invalid terrain
+            tile = self._tile_at_world(pos)
+            if self.terrain_type is not None:
+                terrain = self.terrain_type[tile]
+                invalid_terrain = {
+                    TerrainType.WATER, TerrainType.RIVER, TerrainType.CLIFF,
+                    TerrainType.FOREST, TerrainType.DENSE_FOREST
+                }
+                if terrain in invalid_terrain:
+                    return False
+
+            # Not too close to any spawn (use spawn_flat_radius as exclusion zone)
+            spawn_exclusion = self.cfg.spawn_flat_radius * self.ts
+            if any(self._distance(pos, sp) < spawn_exclusion for sp in all_spawn_positions):
                 return False
 
             # Not too close to gold mines
@@ -559,7 +680,9 @@ class MyWorld:
                     # Pick a random spawn from this team and place near it
                     base_spawn = rng.choice(team_spawn_positions)
                     angle = rng.uniform(0, 2 * math.pi)
-                    dist = rng.uniform(self.ts * 6, easy_max_dist)
+                    # Minimum distance must be outside the spawn exclusion zone
+                    min_dist = self.cfg.spawn_flat_radius * self.ts + self.ts
+                    dist = rng.uniform(min_dist, easy_max_dist)
                     x = base_spawn[0] + dist * math.cos(angle)
                     y = base_spawn[1] + dist * math.sin(angle)
 
@@ -664,12 +787,13 @@ class MyWorld:
     # Phase 4: Terrain Generation
     # =========================================================================
     def _generate_terrain(self):
-        """Generate terrain - mostly land for strategy games."""
+        """Generate terrain - mostly land for strategy games with biome variety."""
         shape = self.shape_tiles
+        rng = random.Random(self.cfg.seed + 500)
 
         self.elevation = np.empty(shape, dtype=float)
         self.is_land = np.ones(shape, dtype=bool)
-        self.terrain_type = np.full(shape, TerrainType.LAND, dtype=int)
+        self.terrain_type = np.full(shape, TerrainType.GRASS, dtype=int)
         self.is_trail = np.zeros(shape, dtype=bool)
         self.is_forest = np.zeros(shape, dtype=bool)
 
@@ -698,7 +822,78 @@ class MyWorld:
                 self.is_land[tile] = False
                 self.terrain_type[tile] = TerrainType.WATER
 
-        # Ensure spawn areas are flat land
+        # === Biome Generation using Poisson Disc Sampling ===
+        # Generate biome seed points
+        bounds = (0, 0, self.width, self.height)
+        biome_points = poisson_disc_2d(
+            bounds=bounds,
+            radius=self.cfg.biome_point_radius,
+            n_points=500,  # Target many points, Poisson will naturally limit
+            seed=self.cfg.seed + 600
+        )
+
+        # Assign terrain type to each biome point
+        biome_types: list[TerrainType] = []
+        total_weight = self.cfg.biome_grass_weight + self.cfg.biome_sand_weight + self.cfg.biome_land_weight
+        for _ in biome_points:
+            r = rng.random() * total_weight
+            if r < self.cfg.biome_grass_weight:
+                biome_types.append(TerrainType.GRASS)
+            elif r < self.cfg.biome_grass_weight + self.cfg.biome_sand_weight:
+                biome_types.append(TerrainType.SAND)
+            else:
+                biome_types.append(TerrainType.LAND)
+
+        # Apply biomes to land tiles using nearest neighbor with noise
+        if biome_points:
+            for tile in np.ndindex(shape):
+                if not self.is_land[tile]:
+                    continue
+
+                x, y = self._tile_to_world(tile)
+
+                # Add noise to position for organic boundaries
+                noise_offset = self.cfg.biome_blend_noise * self.cfg.biome_point_radius
+                noise_x = perlin2d_fbm(x / 100, y / 100, octaves=2, seed=self.cfg.seed + 700) * noise_offset
+                noise_y = perlin2d_fbm(x / 100 + 100, y / 100 + 100, octaves=2, seed=self.cfg.seed + 701) * noise_offset
+                sample_x = x + noise_x
+                sample_y = y + noise_y
+
+                # Find nearest biome point
+                min_dist = float('inf')
+                nearest_biome = TerrainType.GRASS
+                for i, bp in enumerate(biome_points):
+                    dist = self._distance((sample_x, sample_y), bp)
+                    if dist < min_dist:
+                        min_dist = dist
+                        nearest_biome = biome_types[i]
+
+                self.terrain_type[tile] = nearest_biome
+
+        # === Add shallow water along coastlines ===
+        shallow_width = self.cfg.shallow_water_width
+        water_tiles = set()
+        for tile in np.ndindex(shape):
+            if self.terrain_type[tile] == TerrainType.WATER:
+                water_tiles.add(tile)
+
+        for tile in list(water_tiles):
+            tx, ty = tile
+            # Check if near land
+            is_coastal = False
+            for dx in range(-shallow_width, shallow_width + 1):
+                for dy in range(-shallow_width, shallow_width + 1):
+                    nx, ny = tx + dx, ty + dy
+                    if self.is_tile_in_bounds((nx, ny)) and self.is_land[nx, ny]:
+                        is_coastal = True
+                        break
+                if is_coastal:
+                    break
+
+            if is_coastal:
+                self.terrain_type[tile] = TerrainType.SHALLOW_WATER
+
+        # Ensure spawn areas are flat land (grass for better visibility)
         spawn_flat_radius = self.cfg.spawn_flat_radius
         for spawn in self.spawns:
             sx, sy = spawn.tile
@@ -707,7 +902,7 @@ class MyWorld:
                     tx, ty = sx + dx, sy + dy
                     if self.is_tile_in_bounds((tx, ty)):
                         self.is_land[tx, ty] = True
-                        self.terrain_type[tx, ty] = TerrainType.LAND
+                        self.terrain_type[tx, ty] = TerrainType.GRASS
                         dist = math.sqrt(dx ** 2 + dy ** 2)
                         if dist <= spawn_flat_radius:
                             blend = dist / spawn_flat_radius
@@ -724,8 +919,8 @@ class MyWorld:
                     tx, ty = mx + dx, my + dy
                     if self.is_tile_in_bounds((tx, ty)):
                         self.is_land[tx, ty] = True
-                        if self.terrain_type[tx, ty] == TerrainType.WATER:
-                            self.terrain_type[tx, ty] = TerrainType.LAND
+                        if self.terrain_type[tx, ty] in (TerrainType.WATER, TerrainType.SHALLOW_WATER):
+                            self.terrain_type[tx, ty] = TerrainType.GRASS
 
         for camp in self.creep_camps:
             ccx, ccy = camp.tile
@@ -734,8 +929,8 @@ class MyWorld:
                     tx, ty = ccx + dx, ccy + dy
                     if self.is_tile_in_bounds((tx, ty)):
                         self.is_land[tx, ty] = True
-                        if self.terrain_type[tx, ty] == TerrainType.WATER:
-                            self.terrain_type[tx, ty] = TerrainType.LAND
+                        if self.terrain_type[tx, ty] in (TerrainType.WATER, TerrainType.SHALLOW_WATER):
+                            self.terrain_type[tx, ty] = TerrainType.GRASS
 
     # =========================================================================
     # Phase 5: Trail Generation (Dijkstra-based)
@@ -757,18 +952,34 @@ class MyWorld:
         def passable(x: int, y: int) -> bool:
             if not self.is_tile_in_bounds((x, y)):
                 return False
-            return self.is_land[x, y]
+            terrain = self.terrain_type[x, y]
+            # Allow land types and shallow water, block deep water/river/cliff
+            impassable = {TerrainType.WATER, TerrainType.RIVER, TerrainType.CLIFF}
+            return terrain not in impassable
 
         def cost_of(x: int, y: int, nx: int, ny: int) -> float:
             if not self.is_tile_in_bounds((nx, ny)):
                 return float('inf')
-            base_cost = 1.0
-            # Higher cost for elevated terrain
+
+            terrain = self.terrain_type[nx, ny]
+
+            # Terrain-based costs
+            if terrain == TerrainType.SAND:
+                base_cost = 2.5  # Paths prefer to avoid sand
+            elif terrain == TerrainType.SHALLOW_WATER:
+                base_cost = 2.0  # Passable but costly
+            elif terrain in (TerrainType.GRASS, TerrainType.LAND):
+                base_cost = 1.0  # Normal cost
+            else:
+                base_cost = 1.0
+
+            # Elevation modifier
             elev = self.elevation[nx, ny]
             if elev > 0.7:
-                base_cost = 2.5
+                base_cost *= 2.5
             elif elev > 0.5:
-                base_cost = 1.5
+                base_cost *= 1.5
+
             return base_cost
 
         # Create trails between teammates
@@ -1002,8 +1213,11 @@ class MyWorld:
         # Initialize forest map with random seeds
         forest_map = np.zeros(shape, dtype=bool)
 
+        # Terrain types that can have forests
+        forest_terrain = {TerrainType.GRASS, TerrainType.LAND}
+
         for tile in np.ndindex(shape):
-            if self.is_land[tile] and self.terrain_type[tile] == TerrainType.LAND:
+            if self.is_land[tile] and self.terrain_type[tile] in forest_terrain:
                 if rng.random() < self.cfg.forest_initial_density:
                     forest_map[tile] = True
 
@@ -1013,7 +1227,7 @@ class MyWorld:
 
             for x in range(shape[0]):
                 for y in range(shape[1]):
-                    if not self.is_land[x, y] or self.terrain_type[x, y] != TerrainType.LAND:
+                    if not self.is_land[x, y] or self.terrain_type[x, y] not in forest_terrain:
                         continue
 
                     # Count forest neighbors (8-connected)
@@ -1070,9 +1284,9 @@ class MyWorld:
                 if rng.random() < 0.5:
                     forest_map[tile] = False
 
-        # Apply forest to terrain type
+        # Apply forest to terrain type (on grass and land)
         for tile in np.ndindex(shape):
-            if forest_map[tile] and self.terrain_type[tile] == TerrainType.LAND:
+            if forest_map[tile] and self.terrain_type[tile] in forest_terrain:
                 self.terrain_type[tile] = TerrainType.FOREST
                 self.is_forest[tile] = True
 
@@ -1098,6 +1312,8 @@ class MyWorld:
 
             if terrain == TerrainType.WATER:
                 color = colormap(elevation + 0.3, COLOR_WATER)
+            elif terrain == TerrainType.SHALLOW_WATER:
+                color = colormap(elevation + 0.4, COLOR_SHALLOW_WATER)
             elif terrain == TerrainType.RIVER:
                 color = colormap(0.8, COLOR_RIVER)
             elif terrain == TerrainType.BRIDGE:
@@ -1108,8 +1324,14 @@ class MyWorld:
                 color = colormap(elevation, COLOR_DENSE_FOREST)
             elif terrain == TerrainType.FOREST:
                 color = colormap(elevation, COLOR_FOREST)
-            else:
+            elif terrain == TerrainType.SAND:
+                color = colormap(elevation, COLOR_SAND)
+            elif terrain == TerrainType.GRASS:
+                color = colormap(elevation, COLOR_GRASS)
+            elif terrain == TerrainType.LAND:
                 color = colormap(elevation, COLOR_LAND)
+            else:
+                color = colormap(elevation, COLOR_GRASS)  # Fallback
 
             draw_tile(ctx, tile, ts, color)
 
@@ -1128,7 +1350,20 @@ class MyWorld:
                         (center[0] - size, center[1] + size),
                         (center[0] + size, center[1] + size),
                     ]
-                    color = (0, 60, 0) if self.terrain_type[tile] == TerrainType.DENSE_FOREST else (0, 80, 0)
+                    # Vary tree color based on position for natural look
+                    terrain = self.terrain_type[tile]
+                    elev = self.elevation[tile]
+                    tx, ty = tile
+                    
+                    if terrain == TerrainType.DENSE_FOREST:
+                        color = (0, 50, 0)  # Very dark
+                    else:
+                        # Vary green shade based on position and elevation
+                        variation = ((tx * 7 + ty * 11) % 30) - 15  # -15 to +15
+                        base_green = int(70 + elev * 20 + variation)
+                        base_green = max(40, min(100, base_green))
+                        color = (0, base_green, 0)
+                    
                     pygame.draw.polygon(ctx.screen, color, points)
 
     def _draw_rivers(self, ctx: RenderContext) -> None:
